@@ -1,0 +1,279 @@
+#Enable the RBAC on Istio
+apiVersion: "rbac.istio.io/v1alpha1"
+kind: RbacConfig
+metadata:
+  name: default
+spec:
+  mode: 'ON_WITH_INCLUSION'
+  inclusion:
+    namespaces: ["palo-alto-demo"]
+---
+#Creates two service accounts in palo-alto-demo namespace
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ro-istio-rbac
+  namespace: palo-alto-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ro-serviceaccount
+  namespace: palo-alto-demo
+---
+#Creates a Kuberneyes RBAC role which has 'pods'
+# and 'services' read only access
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: Role
+metadata:
+  name: ro-role  #Role name
+  namespace: palo-alto-demo
+rules:
+- apiGroups: ["*"]
+  resources: ["pods", "services"]
+  verbs: ["get","list","watch","exec"]
+---
+#Binds the read only RBAC role to both the service accounts
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ro-binding  #RoleBinding name
+  namespace: palo-alto-demo
+roleRef:
+  kind: Role
+  name: ro-role  #Reffered role
+  apiGroup: rbac.authorization.k8s.io
+subjects:
+- kind: ServiceAccount
+  name: ro-istio-rbac  #Service account name
+- kind: ServiceAccount
+  name: ro-serviceaccount  #Service account name
+---
+# Creates an Istio's RBAC service role to allow the access of 
+#express service with HTTP GET method
+apiVersion: "rbac.istio.io/v1alpha1"
+kind: ServiceRole
+metadata:
+  name: get-content
+  namespace: palo-alto-demo
+spec:
+  rules:
+  - services: 
+    - "express.palo-alto-demo.svc.cluster.local"
+    paths: ["*"]
+    methods: ["GET", "HEAD"]
+---
+#Binds an Istio's RBAC service role with a user(service account),
+#here 'ro-istio-rbac' service account, it is attached to 
+#graphql deployment and hence it can access express service.
+apiVersion: "rbac.istio.io/v1alpha1"
+kind: ServiceRoleBinding
+metadata:
+  name: get-content-binding
+  namespace: palo-alto-demo
+spec:
+  subjects:
+  - user: "cluster.local/ns/palo-alto-demo/sa/ro-istio-rbac"
+  roleRef:
+    kind: ServiceRole
+    name: "get-content"
+---
+#Creates a service role which allows POST call to the graphql
+#service 
+apiVersion: "rbac.istio.io/v1alpha1"
+kind: ServiceRole
+metadata:
+  name: allow-user-access
+  namespace: palo-alto-demo
+spec:
+  rules:
+  - services: 
+    - "graphql.palo-alto-demo.svc.cluster.local"
+    paths: ["*"]
+    methods: ["POST"]
+---
+#Binds the service role to every user trying to reach the graphql service.
+apiVersion: "rbac.istio.io/v1alpha1"
+kind: ServiceRoleBinding
+metadata:
+  name: allow-user-access-binding
+  namespace: palo-alto-demo
+spec:
+  subjects:
+  - user: "*"
+  roleRef:
+    kind: ServiceRole
+    name: "allow-user-access"
+---
+#Creates a deployment with name graphql, it uses the 
+#image pushed in GCR. Also a service account 'ro-istio-rbac'
+#is attached and hence the pod will only have read
+#only access for pods and services with Istio's rbac to access 
+#the express service. The container listens on port 4000
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: graphql
+  name: graphql
+  namespace: palo-alto-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: graphql
+  template:
+    metadata:
+      labels:
+        app: graphql
+    spec:
+      serviceAccount: ro-istio-rbac
+      containers:
+      - image: gcr.io/palo-alto-networks-234507/graphql:v1
+        name: graphql
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 4000
+
+---
+#Creates a deployment with name express, it uses the 
+#image pushed in GCR. Also a service account 'ro-serviceaccount' 
+#is attached and hence the pod will only have read only access 
+#for pods and services. The container listens on port 3000
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: express
+  name: express
+  namespace: palo-alto-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: express
+  template:
+    metadata:
+      labels:
+        app: express
+    spec:
+      serviceAccount: ro-serviceaccount
+      containers:
+      - image: gcr.io/palo-alto-networks-234507/express:v1
+        name: express
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+---
+#Creates a service which redirects the traffic recieved on port 4000
+#to graphql's port 4000
+kind: Service
+apiVersion: v1
+metadata:
+  name: graphql
+  namespace: palo-alto-demo
+  labels:
+    app: graphql
+spec:
+  selector:
+    app: graphql
+  ports:
+  - port: 4000
+    name: http
+    targetPort: 4000
+  type: ClusterIP
+---
+#Creates a service which redirects the traffic recieved on port 3000
+#to express port 3000
+kind: Service
+apiVersion: v1
+metadata:
+  name: express
+  namespace: palo-alto-demo
+  labels:
+    app: express
+spec:
+  selector:
+    app: express
+  ports:
+  - port: 3000
+    name: http
+    targetPort: 3000
+  type: ClusterIP
+
+---
+#Creates a gateway which listens on port
+#80 and 443. It redirects every port 80 request to port
+#443 recieving from any host with tls
+apiVersion: networking.istio.io/v1alpha3
+kind: Gateway
+metadata:
+  name: graphql-gateway
+  namespace: palo-alto-demo
+spec:
+  selector:
+    istio: ingressgateway # use istio default controller
+  servers:
+  - port:
+      number: 80
+      name: http
+      protocol: HTTP
+    hosts:
+    - "*"
+    tls:
+      httpsRedirect: true
+  - port:
+      number: 443
+      name: https
+      protocol: HTTPS
+    hosts:
+    - "*"
+    tls:
+      mode: SIMPLE
+      serverCertificate: /etc/istio/ingressgateway-certs/tls.crt
+      privateKey: /etc/istio/ingressgateway-certs/tls.key
+---
+#Redirects only '/graphql' endpoint being recieved from the
+#gateway to graphql service on port 4000
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: graphql-vs
+  namespace: palo-alto-demo
+spec:
+  hosts:
+  - "*"
+  gateways:
+  - graphql-gateway
+  http:
+  - match:
+    - uri:
+        exact: /graphql
+    route:
+    - destination:
+        host: graphql
+        port:
+          number: 4000
+---
+#Policy defines the url of Okta to validate the token
+#It listens every requests from port 80, and 443
+apiVersion: authentication.istio.io/v1alpha1
+kind: Policy
+metadata:
+  name: ingressgateway
+  namespace: istio-system
+spec:
+  targets:
+  - name: istio-ingressgateway
+    ports:
+    - number: 80
+    ports:
+    - number: 443
+  peers:
+  - mtls: {}
+  origins:
+  - jwt:
+      audiences:
+      - "api://default"
+      issuer: "https://dev-652754.okta.com/oauth2/default"
+  principalBinding: USE_ORIGIN
